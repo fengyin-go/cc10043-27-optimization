@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.delivery import delivery_ledger
 from app.store import store
 
 
@@ -59,6 +60,49 @@ class StreamSourceService(BaseModuleService):
             msg_id = f"msg-{entry_id}-{datetime.now(timezone.utc).timestamp():.0f}-{i}"
             messages.append({"id": msg_id, "topic": topic, "source": source, "payload": f"{topic}-data-{i}"})
         return messages
+
+    # ---- 业务扩展：凭接收确认选择可消费输入 ----
+
+    def consumable_inputs(self, entry_id: int) -> dict[str, Any]:
+        """从接收凭据中选定本流源实际可消费的输入。
+
+        只认已签收（接收确认成立）的凭据，并把原交付编号和所收到的内容
+        一一对应返回；确认丢失、冲突、重送都不会产生新的可消费输入。
+        """
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None or entry.get("status") != "运行中":
+            return {"ok": False, "message": "消息流源未运行", "inputs": []}
+        topic = entry.get("Topic/Queue名", "")
+        inputs = delivery_ledger.consumable_inputs(topic=topic)
+        return {"ok": True, "topic": topic, "count": len(inputs), "inputs": inputs}
+
+    def consume_confirmed(self, entry_id: int, receipt_no: str) -> dict[str, Any]:
+        """按签收凭据实际消费载荷，重复消费会被台账拒绝。"""
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None or entry.get("status") != "运行中":
+            return {"ok": False, "message": "消息流源未运行"}
+        receipt = delivery_ledger.get_by_receipt_no(receipt_no)
+        if receipt is None:
+            return {"ok": False, "message": "签收凭据不存在"}
+        if receipt.get("Topic") != entry.get("Topic/Queue名", ""):
+            return {"ok": False, "message": "凭据不属于该消息流源的Topic/Queue"}
+        return delivery_ledger.consume(receipt_no)
+
+    def recover_pending_delivery(
+        self,
+        source_key: str,
+        delivery_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """恢复入口：连接器在返回前退出后，由消息流侧重放待确认交付。
+
+        与连接器首次接收走同一个 ``delivery_ledger.receive`` 裁决，因此两个入口
+        对同一交付的判断必然一致：同内容重放取回原凭据，内容变化判冲突，
+        不会因为恢复而重复写入。
+        """
+        existing = delivery_ledger.find_receipt(source_key, delivery_id)
+        topic = existing["Topic"] if existing is not None else ""
+        return delivery_ledger.receive(source_key, delivery_id, payload, topic=topic)
 
     def validate_message(self, message: dict[str, Any]) -> list[str]:
         """校验消息结构和必填字段。"""

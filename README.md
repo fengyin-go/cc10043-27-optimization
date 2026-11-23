@@ -79,5 +79,20 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 上游交付的幂等接收与签收凭据
+
+连接器写好载荷却在返回确认前退出时，调用方重送会造成重复写入。平台用
+`backend/app/services/delivery.py` 的交付凭据台账统一裁决，所有入口（连接器
+首收、发送方重送、消息流恢复重放）都走同一个 `receive()`：
+
+- 幂等键是 `(来源标识, 交付编号)` 而非内容指纹：同源同编号同内容返回**首张
+  签收凭据**（`duplicate`，不重复落库）；同编号内容变化则**保留原数据**并判
+  `conflict`；换一个交付编号即使内容相同仍是新交付（`accepted`）。
+- 消息流源只从已签收凭据里选可消费输入（`POST /api/delivery/streams/{id}/consumable`），
+  按凭据实际消费（`.../consume/{receipt_no}`），同一凭据不可重复消费。
+- 完整演练脚本：`backend/sim/idempotent_delivery_demo.py`
+  （`.venv/bin/python -I sim/idempotent_delivery_demo.py`），覆盖确认丢失后
+  重送、同号冲突、异号同内容，核对最终仅两个有效交付。
+
 领域：数据工程
 子方向：数据采集、爬虫与RPA

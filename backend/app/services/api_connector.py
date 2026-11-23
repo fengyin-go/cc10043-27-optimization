@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.delivery import delivery_ledger
 from app.store import store
 
 
@@ -61,6 +62,53 @@ class ApiConnectorService(BaseModuleService):
             "abnormal": False,
         })
         return {"ok": True, "message": "消息已入队", "topic": topic, "message_id": message_id}
+
+    # ---- 业务扩展：幂等交付接收（接收/保存一致性） ----
+
+    def source_key(self, entry_id: int) -> str:
+        """上游来源标识：同一连接器的所有交付共用同一来源命名空间。"""
+        return f"api-connector:{entry_id}"
+
+    def ingest_delivery(
+        self,
+        entry_id: int,
+        delivery_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """按上游交付编号幂等接收载荷。
+
+        - 同源同交付编号内容相同：返回首张签收凭据（不重复写入）；
+        - 同交付编号内容变化：保留原数据，返回冲突；
+        - 不同交付编号（即使内容相同）：作为新交付签收。
+        """
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None or entry.get("status") != "已连通":
+            return {"ok": False, "outcome": "rejected", "message": "连接器不可用或未连通"}
+        entry["最近调用时间"] = datetime.now(timezone.utc).isoformat()
+        topic = f"api-{entry.get('连接器名称', 'unnamed')}-{entry_id}"
+        return delivery_ledger.receive(
+            self.source_key(entry_id), delivery_id, payload, topic=topic)
+
+    def lookup_delivery(self, entry_id: int, delivery_id: str) -> dict[str, Any]:
+        """调用方重送前/超时后查询交付结果，取回首张签收凭据。"""
+        receipt = delivery_ledger.find_receipt(self.source_key(entry_id), delivery_id)
+        if receipt is None:
+            return {"ok": False, "found": False, "message": "无该交付的接收凭据"}
+        return {
+            "ok": True,
+            "found": True,
+            "outcome": "duplicate",
+            "receipt": receipt,
+            "message": "命中首张签收凭据，可安全重发或直接采信",
+        }
+
+    def simulate_ack_lost(self, entry_id: int, delivery_id: str) -> dict[str, Any]:
+        """模拟连接器已写好载荷、却在返回确认前退出（确认丢失）。"""
+        receipt = delivery_ledger.find_receipt(self.source_key(entry_id), delivery_id)
+        if receipt is None:
+            return {"ok": False, "message": "交付不存在，无法模拟确认丢失"}
+        marked = delivery_ledger.mark_ack_lost(receipt["签收凭据"])
+        return {"ok": True, "message": "已模拟确认在返回前丢失", "receipt": marked}
 
     def validate_request(self, entry_id: int, method: str, params: dict[str, Any]) -> list[str]:
         """校验API请求参数：必填字段、认证凭据、方法合法性、频率上限。"""
